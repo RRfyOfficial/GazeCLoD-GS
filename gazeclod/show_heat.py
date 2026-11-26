@@ -31,10 +31,17 @@ def turbo(x):
 
 
 def crowd_heat(npz_path, users=None):
-    z = np.load(npz_path)
-    sel = np.ones(len(z["users"]), bool) if not users else np.isin(z["users"], users)
-    mode = str(z["mode"]) if "mode" in z.files else "mass"
-    return z["heat"][sel].sum(0), list(z["users"][sel]), mode
+    """Crowd heat of one file, or of several joined with '+' (summed, e.g. gaze + head mass)."""
+    parts = npz_path.split("+")
+    H, names = None, []
+    for p in parts:
+        z = np.load(p)
+        sel = np.ones(len(z["users"]), bool) if not users else np.isin(z["users"], users)
+        H = z["heat"][sel].sum(0) if H is None else H + z["heat"][sel].sum(0)
+        names.append(str(z["mode"]) if "mode" in z.files else "mass")
+        user_list = list(z["users"][sel])
+    mode = " + ".join(names) if len(names) > 1 else names[0]
+    return H, user_list, mode
 
 
 def concentration(H):
@@ -60,7 +67,9 @@ def main():
     ap.add_argument("--ids", type=int, nargs="*", default=[0, 10, 20],
                     help="cameras.json ids to render (0-31 are the test views)")
     ap.add_argument("--width", type=int, default=800)
-    ap.add_argument("--gamma", type=float, default=0.5, help="<1 brightens weak heat")
+    ap.add_argument("--gamma", type=float, default=0.5, help="linear scale only: <1 brightens weak heat")
+    ap.add_argument("--scale", default="log", choices=["log", "linear"],
+                    help="log: colors span the 50th to 99.9th percentile of positive heat on a log scale")
     args = ap.parse_args()
 
     gs, _ = load_model(args.model, args.iteration)
@@ -78,10 +87,17 @@ def main():
               f"Half of all heat sits on {f50:.2%} of Gaussians, 90% on {f90:.2%}.")
         Ht = torch.tensor(H, device="cuda")
         pos = Ht[Ht > 0]
-        ref = torch.quantile(pos[::max(1, pos.numel() // 1_000_000)], 0.99)
-        hv = (Ht / ref).clamp(0, 1) ** args.gamma
+        sub = pos[::max(1, pos.numel() // 1_000_000)]
+        if args.scale == "log":
+            lo, hi = torch.log(torch.quantile(sub, 0.5)), torch.log(torch.quantile(sub, 0.999))
+            hv = ((torch.log(Ht.clamp_min(1e-20)) - lo) / (hi - lo)).clamp(0, 1)
+            hv[Ht <= 0] = 0
+        else:
+            hv = (Ht / torch.quantile(sub, 0.99)).clamp(0, 1) ** args.gamma
         colors = (1 - hv[:, None]) * gray + hv[:, None] * turbo(hv)
-        columns.append((f"{mode} heat, {len(users)} people (blue = ignored, red = looked at)", colors))
+        nice = {"mass": "crowd gaze", "mass_head": "crowd head direction", "mass + mass_head": "crowd head + gaze",
+                "density": "gaze (stamp scoring)"}.get(mode, mode)
+        columns.append((f"{nice} heat, {len(users)} people, {args.scale} scale (blue = ignored, red = most looked at)", colors))
 
     rows = []
     for cam in photo_cameras(args.model, args.width, ids=args.ids):
@@ -101,7 +117,8 @@ def main():
     for r in rows:
         sheet.paste(r, (0, y))
         y += r.height
-    out = os.path.splitext(args.heat[0])[0] + "_preview.png"
+    first = args.heat[0].split("+")[0]
+    out = os.path.splitext(first)[0] + ("_combo" if "+" in args.heat[0] else "") + "_preview.png"
     sheet.save(out)
     print("Saved", out)
 
