@@ -15,7 +15,6 @@ Writes  <model>/gaze_check/align_<site>_<user>.png
 import argparse
 import os
 import sys
-from argparse import Namespace  # noqa: F401  (needed to eval cfg_args)
 
 import numpy as np
 import torch
@@ -27,30 +26,7 @@ if REPO not in sys.path:
 
 from gazeclod import gaze_io as G  # noqa: E402
 from gazeclod.cam_utils import focal, make_minicam, project_dir  # noqa: E402
-from gaussian_renderer import render  # noqa: E402
-from scene.gaussian_model import GaussianModel  # noqa: E402
-
-try:
-    from diff_gaussian_rasterization import SparseGaussianAdam  # noqa: F401
-    SEPARATE_SH = True
-except Exception:
-    SEPARATE_SH = False
-
-
-def load_model(model_dir, iteration):
-    with open(os.path.join(model_dir, "cfg_args")) as f:
-        cfg = eval(f.read())  # 3DGS saves its args as a Namespace(...) string
-    gs = GaussianModel(cfg.sh_degree, enable_opacity_decay_train=True)
-    gs.load_ply(os.path.join(model_dir, "point_cloud", f"iteration_{iteration}", "point_cloud.ply"))
-    return gs, cfg
-
-
-def lod_pipe():
-    # Same switches render.py uses: decayed opacity + distance culling
-    return Namespace(convert_SHs_python=False, compute_cov3D_python=False, debug=False,
-                     antialiasing=False, enable_decay_opacity_render=True,
-                     enable_distance_culling=True, opacity_threshold=0.005,
-                     enable_view_distance=False)
+from gazeclod.common import load_model, lod_pipe, render_rgb  # noqa: E402
 
 
 def main():
@@ -98,7 +74,7 @@ def main():
     for i in picks:
         cam = make_minicam(tr["R_c2w"][i], tr["C"][i], W, H, fov, fov)
         with torch.no_grad():
-            pkg = render(cam, gs, pipe, bg, virtual_scale=args.s, separate_sh=SEPARATE_SH)
+            pkg = render_rgb(cam, gs, pipe, bg, s=args.s)
         img = (pkg["render"].clamp(0, 1).permute(1, 2, 0).cpu().numpy() * 255).astype(np.uint8)
         im = Image.fromarray(img)
         d = ImageDraw.Draw(im)
