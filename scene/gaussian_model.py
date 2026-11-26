@@ -618,7 +618,12 @@ class GaussianModel:
         # 4. compute LOD mask
         if enable_distance_culling:
             if topk_big is None:
-                lod_mask = decayed_opacity.squeeze(-1) > opacity_threshold*virtual_depth_scale#opacity_threshold+(1-opacity_threshold)*(1-1/virtual_depth_scale)#！
+                # GazeCLoD-GS: virtual_depth_scale may be a per-Gaussian (N,1) tensor. Squeeze the threshold
+                # so the comparison stays elementwise (N,) instead of broadcasting to N x N. Same result for a scalar.
+                _thr = opacity_threshold*virtual_depth_scale
+                if torch.is_tensor(_thr):
+                    _thr = _thr.reshape(-1)
+                lod_mask = decayed_opacity.squeeze(-1) > _thr#opacity_threshold+(1-opacity_threshold)*(1-1/virtual_depth_scale)#！
                 num_points = decayed_opacity.shape[0]    # total number of points
                 k = min(5000, num_points)  
                 valid_points = lod_mask.sum().item()  # sum the mask
