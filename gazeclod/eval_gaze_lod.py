@@ -131,12 +131,24 @@ def timed_render(cam, gs, pipe, bg, s):
 
 # ---------------------------------------------------------------- policies
 class HeatBank:
-    """All per-user heat of one file in memory, so any subset is a quick sum."""
+    """
+    All per-user heat of one file in memory, so any subset is a quick sum.
+    A path like "a.npz+b.npz" adds the files user by user (e.g. gaze + head
+    mass heat: every glance then credits both where the eyes and where the
+    head pointed). Mass heat is normalized per glance, so the two are on the
+    same scale.
+    """
 
     def __init__(self, path):
-        z = np.load(path)
+        parts = path.split("+")
+        z = np.load(parts[0])
         self.users = [str(u) for u in z["users"]]
-        self.heat = z["heat"]
+        self.heat = z["heat"].astype(np.float32)
+        for extra in parts[1:]:
+            z2 = np.load(extra)
+            if [str(u) for u in z2["users"]] != self.users:
+                raise ValueError(f"{extra} has different users than {parts[0]}")
+            self.heat = self.heat + z2["heat"]
 
     def h(self, users, gamma):
         idx = [self.users.index(u) for u in users]
@@ -145,10 +157,11 @@ class HeatBank:
 
 def build_policies(bank, heat_team, args, cross_bank, extra_banks=()):
     h_main = bank.h(heat_team, args.gamma)
-    pols = [("uniform", None, 0.0), (f"gaze_k{args.k:g}", h_main, args.k)]
+    m = args.main_name
+    pols = [("uniform", None, 0.0), (f"{m}_k{args.k:g}", h_main, args.k)]
     for kk in args.k_sweep:
         if kk != args.k:
-            pols.append((f"gaze_k{kk:g}", h_main, kk))
+            pols.append((f"{m}_k{kk:g}", h_main, kk))
     if not args.no_shuffled:
         pols.append((f"shuffled_k{args.k:g}", shuffled(h_main, seed=0), args.k))
     rng = np.random.default_rng(0)
@@ -221,7 +234,8 @@ def summarize(csv_path):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("-m", "--model", required=True)
-    ap.add_argument("--heat", help="NTHU heat .npz (per-user rows) from heatmap.py")
+    ap.add_argument("--heat", help="NTHU heat .npz (per-user rows) from heatmap.py; 'a.npz+b.npz' sums files")
+    ap.add_argument("--main-name", default="gaze", help="policy name prefix for the --heat file")
     ap.add_argument("--summary", help="only print the summary of this CSV and exit")
     ap.add_argument("--tag", default="e1", help="results file name: results_<tag>.csv")
     ap.add_argument("--iteration", type=int, default=30000)
