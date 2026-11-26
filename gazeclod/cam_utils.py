@@ -28,6 +28,18 @@ def project_dir(R_c2w, d, width, height, fovx, fovy):
     return u, v
 
 
+def angle_map(R_c2w, d, size, fov):
+    """Degrees between each pixel's ray and the gaze direction, (size, size) numpy."""
+    f = focal(fov, size)
+    u = np.arange(size) - (size - 1) / 2.0
+    X, Y = np.meshgrid(u, u)
+    rays = np.stack([X / f, Y / f, np.ones_like(X)], -1)
+    rays /= np.linalg.norm(rays, axis=-1, keepdims=True)
+    g = R_c2w.T @ d
+    g /= np.linalg.norm(g)
+    return np.degrees(np.arccos(np.clip(rays @ g, -1.0, 1.0)))
+
+
 def make_minicam(R_c2w, C, width, height, fovx, fovy, znear=0.01, zfar=100.0):
     """A 3DGS MiniCam for an arbitrary pose (needs CUDA, imports the repo)."""
     import torch

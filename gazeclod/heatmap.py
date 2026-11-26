@@ -94,53 +94,76 @@ def foveal_weights(px, fov, sigma_deg):
     return torch.tensor(w / w.sum(), dtype=torch.float32, device="cuda")
 
 
+class DensitySampler:
+    """
+    Density heat from ONE gaze sample: exp(-theta_i^2 / 2 sigma^2) * visible_i for
+    every Gaussian, as an (N,) cuda tensor. Shared by the crowd heatmap (summed
+    over many samples) and the live-gaze upper bound in eval_gaze_lod.py.
+    """
+
+    def __init__(self, gs, pipe, px, sigma_deg, tol=0.1, s=1.0):
+        self.gs, self.pipe, self.px, self.tol, self.s = gs, pipe, px, tol, s
+        self.fov = math.radians(6 * sigma_deg)  # gaze camera covers +-3 sigma
+        self.xyz = gs.get_xyz.detach()
+        n = self.xyz.shape[0]
+        self.ones = torch.ones((n, 3), device="cuda")
+        self.bg = torch.zeros(3, device="cuda")
+        self.f = focal(self.fov, px)
+        self.c0 = (px - 1) / 2.0
+        self.cos_cone = math.cos(self.fov / 2)
+        self.two_sig2 = 2 * math.radians(sigma_deg) ** 2
+        self.inf = torch.full((px, px), float("inf"), device="cuda")
+
+    @torch.no_grad()
+    def __call__(self, R_c2w, C, d):
+        px = self.px
+        heat = torch.zeros(self.xyz.shape[0], device="cuda")
+        R = gaze_camera_pose(R_c2w, d)
+        cam = make_minicam(R, C, px, px, self.fov, self.fov)
+        pkg = render_colors(cam, self.gs, self.pipe, self.bg, self.ones, self.s)
+        acc = pkg["render"][0]   # accumulated opacity per pixel (colors are all 1, bg 0)
+        inv = pkg["depth"][0]    # sum_i T_i alpha_i / z_i
+        zs = torch.where(acc > 0.5, acc / inv.clamp_min(1e-8), self.inf)  # surface depth, inf = empty
+        zs = F.max_pool2d(zs[None, None], 3, stride=1, padding=1)[0, 0]  # lenient at edges
+        Rt = torch.tensor(R, dtype=torch.float32, device="cuda")
+        Ct = torch.tensor(C, dtype=torch.float32, device="cuda")
+        X = (self.xyz - Ct) @ Rt      # camera coords, +z along the gaze
+        z = X[:, 2]
+        cosang = z / X.norm(dim=1).clamp_min(1e-8)
+        idx = ((z > 0.01) & (cosang > self.cos_cone)).nonzero().squeeze(1)
+        if idx.numel() == 0:
+            return heat
+        Xi, zi = X[idx], z[idx]
+        u = (self.f * Xi[:, 0] / zi + self.c0).round().long().clamp(0, px - 1)
+        v = (self.f * Xi[:, 1] / zi + self.c0).round().long().clamp(0, px - 1)
+        vis = zi <= zs[v, u] * (1 + self.tol)
+        th = torch.acos(cosang[idx][vis].clamp(-1, 1))
+        heat[idx[vis]] = torch.exp(-th ** 2 / self.two_sig2)
+        return heat
+
+
 def user_heat_density(gs, tr, rows, pipe, px, fov, sigma_deg, tol=0.1, s=1.0, desc=""):
     """Mean visible foveal weight at each Gaussian's centre over this user's samples, (N,) numpy."""
-    n = gs.get_xyz.shape[0]
-    xyz = gs.get_xyz.detach()
-    heat = torch.zeros(n, device="cuda")
-    ones = torch.ones((n, 3), device="cuda")
-    bg = torch.zeros(3, device="cuda")
-    f = focal(fov, px)
-    c0 = (px - 1) / 2.0
-    cos_cone = math.cos(fov / 2)
-    two_sig2 = 2 * math.radians(sigma_deg) ** 2
-    inf = torch.full((px, px), float("inf"), device="cuda")
-    with torch.no_grad():
-        for i in tqdm(rows, desc=desc, leave=False):
-            R = gaze_camera_pose(tr["R_c2w"][i], tr["gaze_d"][i])
-            C = tr["C"][i]
-            cam = make_minicam(R, C, px, px, fov, fov)
-            pkg = render_colors(cam, gs, pipe, bg, ones, s)
-            acc = pkg["render"][0]   # accumulated opacity per pixel (colors are all 1, bg 0)
-            inv = pkg["depth"][0]    # sum_i T_i alpha_i / z_i
-            zs = torch.where(acc > 0.5, acc / inv.clamp_min(1e-8), inf)  # surface depth, inf = empty
-            zs = F.max_pool2d(zs[None, None], 3, stride=1, padding=1)[0, 0]  # lenient at edges
-            Rt = torch.tensor(R, dtype=torch.float32, device="cuda")
-            Ct = torch.tensor(C, dtype=torch.float32, device="cuda")
-            X = (xyz - Ct) @ Rt      # camera coords, +z along the gaze
-            z = X[:, 2]
-            cosang = z / X.norm(dim=1).clamp_min(1e-8)
-            idx = ((z > 0.01) & (cosang > cos_cone)).nonzero().squeeze(1)
-            if idx.numel() == 0:
-                continue
-            Xi, zi = X[idx], z[idx]
-            u = (f * Xi[:, 0] / zi + c0).round().long().clamp(0, px - 1)
-            v = (f * Xi[:, 1] / zi + c0).round().long().clamp(0, px - 1)
-            vis = zi <= zs[v, u] * (1 + tol)
-            th = torch.acos(cosang[idx][vis].clamp(-1, 1))
-            heat[idx[vis]] += torch.exp(-th ** 2 / two_sig2)
+    sampler = DensitySampler(gs, pipe, px, sigma_deg, tol, s)
+    heat = torch.zeros(gs.get_xyz.shape[0], device="cuda")
+    for i in tqdm(rows, desc=desc, leave=False):
+        heat += sampler(tr["R_c2w"][i], tr["C"][i], tr["gaze_d"][i])
     return (heat / max(len(rows), 1)).cpu().numpy()
 
 
-def user_heat_mass(gs, tr, rows, pipe, wfov, px, fov, s=1.0, desc=""):
-    """Mean foveal blending weight per Gaussian over this user's samples, (N,) numpy."""
+def user_heat_mass(gs, tr, rows, pipe, wfov, px, fov, s=1.0, desc="", aim="gaze"):
+    """
+    Mean foveal blending weight per Gaussian over this user's samples, (N,) numpy.
+    aim="gaze" points the tiny camera along the eye's gaze. aim="head" points it
+    along the head's forward direction instead (control: no eye tracking).
+    """
+    aim_key = "gaze_d" if aim == "gaze" else "head_fwd"
     n = gs.get_xyz.shape[0]
     heat = torch.zeros(n, device="cuda")
     colors = torch.full((n, 3), 0.5, device="cuda", requires_grad=True)
     bg = torch.zeros(3, device="cuda")
     for i in tqdm(rows, desc=desc, leave=False):
-        R = gaze_camera_pose(tr["R_c2w"][i], tr["gaze_d"][i])
+        R = gaze_camera_pose(tr["R_c2w"][i], tr[aim_key][i])
         cam = make_minicam(R, tr["C"][i], px, px, fov, fov)
         pkg = render_colors(cam, gs, pipe, bg, colors, s)
         loss = (pkg["render"][0] * wfov).sum()
@@ -162,12 +185,22 @@ def main():
     ap.add_argument("--mode", default="density", choices=["density", "mass"])
     ap.add_argument("--tol", type=float, default=0.1, help="density mode: depth tolerance (0.1 = 10%%)")
     ap.add_argument("--px", type=int, default=48, help="size of the tiny gaze camera image")
+    ap.add_argument("--aim", default="gaze", choices=["gaze", "head"],
+                    help="mass mode control: point the camera along the head instead of the eyes")
+    ap.add_argument("--window", default="fovea", choices=["fovea", "full"],
+                    help="mass mode control: 'full' scores the whole 90 deg view with equal weight "
+                         "(viewpoint significance, no gaze at all; use with --aim head)")
     ap.add_argument("--s", type=float, default=1.0, help="CLoD scale for the heat renders")
     ap.add_argument("--users", nargs="*", default=None, help="optional subset, e.g. user102 user103")
     args = ap.parse_args()
 
+    if args.mode == "density" and (args.aim != "gaze" or args.window != "fovea"):
+        sys.exit("--aim / --window controls are only implemented for --mode mass")
     fov = math.radians(6 * args.sigma)  # gaze camera covers +-3 sigma
     wfov = foveal_weights(args.px, fov, args.sigma)
+    if args.window == "full":
+        fov = math.radians(90.0)
+        wfov = torch.full((args.px, args.px), 1.0 / args.px ** 2, device="cuda")
     gs, _ = load_model(args.model, args.iteration)
     pipe = lod_pipe()
     print(f"Loaded {gs.get_xyz.shape[0]:,} Gaussians. mode={args.mode}, sigma={args.sigma} deg, "
@@ -189,7 +222,7 @@ def main():
         if args.mode == "density":
             h = user_heat_density(gs, tr, rows, pipe, args.px, fov, args.sigma, args.tol, args.s, desc=uid)
         else:
-            h = user_heat_mass(gs, tr, rows, pipe, wfov, args.px, fov, args.s, desc=uid)
+            h = user_heat_mass(gs, tr, rows, pipe, wfov, args.px, fov, args.s, desc=uid, aim=args.aim)
         users.append(uid)
         heats.append(h.astype(np.float32))
         nsamp.append(len(rows))
@@ -200,9 +233,10 @@ def main():
         sys.exit("No usable users found.")
     out_dir = os.path.join(args.model, "gaze_heat")
     os.makedirs(out_dir, exist_ok=True)
-    out = os.path.join(out_dir, f"heat_{args.site}_{args.scene}_{args.mode}_sig{args.sigma:g}.npz")
+    tag = args.mode + ("" if args.aim == "gaze" else "_head") + ("" if args.window == "fovea" else "_full")
+    out = os.path.join(out_dir, f"heat_{args.site}_{args.scene}_{tag}_sig{args.sigma:g}.npz")
     np.savez_compressed(out, users=np.array(users), heat=np.stack(heats), n_samples=np.array(nsamp),
-                        mode=args.mode, sigma=args.sigma, hz=args.hz, vmax=args.vmax, px=args.px,
+                        mode=tag, aim=args.aim, window=args.window, sigma=args.sigma, hz=args.hz, vmax=args.vmax, px=args.px,
                         tol=args.tol, s=args.s)
     print(f"Saved {out}  ({len(users)} users, {sum(nsamp):,} samples, "
           f"{(time.time() - t_start) / 60:.1f} min)")

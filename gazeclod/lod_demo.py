@@ -30,22 +30,10 @@ if REPO not in sys.path:
     sys.path.insert(0, REPO)
 
 from gazeclod import gaze_io as G  # noqa: E402
-from gazeclod.cam_utils import focal, make_minicam, project_dir  # noqa: E402
+from gazeclod.cam_utils import angle_map, focal, make_minicam, project_dir  # noqa: E402
 from gazeclod.common import load_model, lod_pipe, render_rgb, to_uint8  # noqa: E402
 from gazeclod.lod_policy import (LodState, heat_to_h, match_budget, s_vector,  # noqa: E402
                                  shuffled, split_teams, team_heat)
-
-
-def angle_map(R_c2w, d, size, fov):
-    """Degrees between each pixel's ray and the gaze direction, (size, size) numpy."""
-    f = focal(fov, size)
-    u = np.arange(size) - (size - 1) / 2.0
-    X, Y = np.meshgrid(u, u)
-    rays = np.stack([X / f, Y / f, np.ones_like(X)], -1)
-    rays /= np.linalg.norm(rays, axis=-1, keepdims=True)
-    g = R_c2w.T @ d
-    g /= np.linalg.norm(g)
-    return np.degrees(np.arccos(np.clip(rays @ g, -1.0, 1.0)))
 
 
 def psnr(a, b, mask=None):
@@ -126,9 +114,11 @@ def main():
                 uni = render_rgb(cam, gs, pipe, bg, s=args.s)
                 gaz = render_rgb(cam, gs, pipe, bg, s=s_vector(h, sb_g, args.k)[:, None])
                 shf = render_rgb(cam, gs, pipe, bg, s=s_vector(h_shuf, sb_r, args.k)[:, None])
-            for name, pkg, want in [("uniform", uni, target), ("gaze", gaz, n_g), ("shuffled", shf, n_r)]:
+            for name, pkg, want in [("uniform", uni, st.count_global(args.s)),
+                                    ("gaze", gaz, st.count_global(s_vector(h, sb_g, args.k))),
+                                    ("shuffled", shf, st.count_global(s_vector(h_shuf, sb_r, args.k)))]:
                 if pkg["points_used"] != want:
-                    print(f"  warning: {name} drew {pkg['points_used']:,}, predicted {want:,}")
+                    print(f"  warning: {name} kept {pkg['points_used']:,}, predicted {want:,}")
 
             ang = angle_map(R, d, W, fov)
             fov_mask, per_mask = ang < args.fovea, ang >= args.fovea
@@ -138,14 +128,14 @@ def main():
                            psnr(pkg["render"], ref["render"], fov_mask),
                            psnr(pkg["render"], ref["render"], per_mask))
             results.append(r)
-            print(f"  {uid} t={r['t']:.0f}s  drawn {target:,} ({target / n_total:.0%})  "
+            print(f"  {uid} t={r['t']:.0f}s  in view {target:,}  "
                   f"fovea PSNR uniform {r['uniform'][1]:.2f} | gaze {r['gaze'][1]:.2f} | "
                   f"shuffled {r['shuffled'][1]:.2f}   (s_base gaze {sb_g:.1f}, shuffled {sb_r:.1f})")
 
             uv = project_dir(R, d, W, W, fov, fov)
             ring = (uv, ring_px) if uv is not None else None
             tiles = [tile(ref["render"], f"reference s=1  ({ref['points_used']:,})", ring),
-                     tile(uni["render"], f"uniform s={args.s:g}  ({target:,})  fovea {r['uniform'][1]:.1f} dB", ring),
+                     tile(uni["render"], f"uniform s={args.s:g}  ({target:,} in view)  fovea {r['uniform'][1]:.1f} dB", ring),
                      tile(gaz["render"], f"gaze k={args.k:g}  ({n_g:,})  fovea {r['gaze'][1]:.1f} dB", ring),
                      tile(shf["render"], f"shuffled  ({n_r:,})  fovea {r['shuffled'][1]:.1f} dB", ring)]
             row = Image.new("RGB", (W * 4, W))
@@ -158,7 +148,7 @@ def main():
         m = np.nanmean(np.array([r[name] for r in results]), axis=0)
         print(f"  {name:<10}                      {m[0]:6.2f}  {m[1]:6.2f}  {m[2]:6.2f}")
     mean_budget = np.mean([r["budget"] for r in results])
-    print(f"  budget: {mean_budget:,.0f} Gaussians drawn on average ({mean_budget / n_total:.1%} of {n_total:,})")
+    print(f"  budget: {mean_budget:,.0f} Gaussians in view on average (model has {n_total:,})")
 
     out_dir = os.path.join(args.model, "gaze_lod")
     os.makedirs(out_dir, exist_ok=True)

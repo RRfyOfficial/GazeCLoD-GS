@@ -14,7 +14,7 @@ act as if the camera were closer, so they keep their detail. The clamp at 1
 means nothing is ever drawn with more detail than the full-detail reference.
 
 Fair comparison: for each frame, s_base is found by bisection so the gaze
-version draws no more Gaussians than uniform CLoD-GS at scale s. Every
+version draws no more Gaussians IN VIEW than uniform CLoD-GS at scale s. Every
 Gaussian's keep/drop decision is monotone in its own s_i (fade gets stronger
 and the threshold gets higher), so the count falls steadily as s_base grows.
 """
@@ -74,18 +74,33 @@ class LodState:
     CLoD-GS's keep/drop rule for one camera, with everything that does not
     depend on s precomputed, so trying many s values is cheap. Mirrors
     GaussianModel.get_lod_filter_mask line by line.
+
+    budget="view" counts only kept Gaussians whose centre lies in the view
+    frustum (z > 0.2, inside the field of view plus a 10% margin), i.e. what
+    the rasterizer actually draws. CLoD-GS's own points_used ("global")
+    also counts kept Gaussians behind or beside the camera, which the
+    rasterizer throws away almost for free. A view-dependent policy must be
+    judged on what is in view, so "view" is the default.
     """
 
-    def __init__(self, gs, cam):
+    def __init__(self, gs, cam, budget="view", margin=0.1):
         xyz = gs.get_xyz.detach()
         centroid = torch.mean(xyz, dim=0)
         scene_scale = torch.mean(torch.norm(xyz - centroid, dim=1))
         self.d = (torch.norm(xyz - cam.camera_center, dim=1) / (scene_scale + 1e-6))
         self.var = 2 * torch.relu(gs._opacity_dis_decay.detach().reshape(-1)) ** 2 + 1e-6
         self.opacity = gs.get_opacity.detach().reshape(-1)
+        self.inview = None
+        if budget == "view":
+            # 3DGS uses row vectors: p_view = [x, y, z, 1] @ world_view_transform
+            pv = torch.cat([xyz, torch.ones_like(xyz[:, :1])], 1) @ cam.world_view_transform
+            z = pv[:, 2]
+            tx = math.tan(cam.FoVx / 2) * (1 + margin)
+            ty = math.tan(cam.FoVy / 2) * (1 + margin)
+            self.inview = (z > 0.2) & (pv[:, 0].abs() < z * tx) & (pv[:, 1].abs() < z * ty)
 
     def keep(self, s):
-        """Boolean (N,) mask of Gaussians CLoD-GS would draw at scale s (float or (N,) tensor)."""
+        """Boolean (N,) mask of Gaussians CLoD-GS would keep at scale s (float or (N,) tensor)."""
         scaled = self.d * s
         decay = torch.nan_to_num(torch.exp(-(scaled ** 2) / self.var), nan=0.0, posinf=1.0, neginf=0.0)
         faded = self.opacity * decay
@@ -96,12 +111,20 @@ class LodState:
         return mask
 
     def count(self, s):
+        """Budget count: kept Gaussians in view (budget="view") or all kept ones ("global")."""
+        m = self.keep(s)
+        if self.inview is not None:
+            m = m & self.inview
+        return int(m.sum())
+
+    def count_global(self, s):
+        """All kept Gaussians, what CLoD-GS's render() reports as points_used."""
         return int(self.keep(s).sum())
 
 
 def match_budget(state, h, k, target, s_start, iters=50):
     """
-    Smallest s_base whose gaze knob draws <= target Gaussians.
+    Smallest s_base whose gaze knob's budget count is <= target.
     At s_base = s_start (the uniform s) every s_i <= s_start, so the gaze
     version keeps at least as many; we bisect upward on log(s_base).
     Returns (s_base, count).
