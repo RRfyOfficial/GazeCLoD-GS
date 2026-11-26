@@ -68,8 +68,9 @@ def main():
                     help="cameras.json ids to render (0-31 are the test views)")
     ap.add_argument("--width", type=int, default=800)
     ap.add_argument("--gamma", type=float, default=0.5, help="linear scale only: <1 brightens weak heat")
-    ap.add_argument("--scale", default="log", choices=["log", "linear"],
-                    help="log: colors span the 50th to 99.9th percentile of positive heat on a log scale")
+    ap.add_argument("--scale", default="auto", choices=["auto", "log", "linear"],
+                    help="log: colors span the 50th to 99.9th percentile of positive heat on a log scale. "
+                         "auto: linear for density (stamp) heat, log for mass (blame) heat")
     args = ap.parse_args()
 
     gs, _ = load_model(args.model, args.iteration)
@@ -88,16 +89,18 @@ def main():
         Ht = torch.tensor(H, device="cuda")
         pos = Ht[Ht > 0]
         sub = pos[::max(1, pos.numel() // 1_000_000)]
-        if args.scale == "log":
+        scale = args.scale if args.scale != "auto" else ("linear" if mode == "density" else "log")
+        if scale == "log":
             lo, hi = torch.log(torch.quantile(sub, 0.5)), torch.log(torch.quantile(sub, 0.999))
             hv = ((torch.log(Ht.clamp_min(1e-20)) - lo) / (hi - lo)).clamp(0, 1)
             hv[Ht <= 0] = 0
         else:
             hv = (Ht / torch.quantile(sub, 0.99)).clamp(0, 1) ** args.gamma
         colors = (1 - hv[:, None]) * gray + hv[:, None] * turbo(hv)
-        nice = {"mass": "crowd gaze", "mass_head": "crowd head direction", "mass + mass_head": "crowd head + gaze",
-                "density": "gaze (stamp scoring)"}.get(mode, mode)
-        columns.append((f"{nice} heat, {len(users)} people, {args.scale} scale (blue = ignored, red = most looked at)", colors))
+        nice = {"mass": "gaze, blame scoring", "mass_head": "head direction, blame scoring",
+                "mass + mass_head": "what GazeCLoD-GS protects (head + gaze, blame scoring)",
+                "density": "where eyes landed (stamp scoring, size-free)"}.get(mode, mode)
+        columns.append((f"{nice}, {len(users)} people, {scale} scale", colors))
 
     rows = []
     for cam in photo_cameras(args.model, args.width, ids=args.ids):
