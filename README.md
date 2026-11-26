@@ -20,25 +20,29 @@ GazeCLoD-GS adds the missing piece. It uses recordings of real people in VR to l
 
 CLoD-GS gives every Gaussian $i$ a learned fade rate $\sigma_i$. At render time, one dial $s$ (the *virtual distance scale*) pretends the camera is $s$ times farther away than it really is, and each Gaussian's opacity $\alpha_i$ fades with that pretend distance:
 
-$$
+```math
 \text{decay}_i = \exp\left(-\frac{(d_i\, s)^2}{2\,\mathrm{ReLU}(\sigma_i)^2 + 10^{-6}}\right), \qquad \alpha_i' = \alpha_i \cdot \text{decay}_i
-$$
+```
 
 Here $d_i$ is the Gaussian's distance to the camera divided by the size of the scene (the average distance of all Gaussians from their center). This is the formula as written in their code. A Gaussian is drawn only if its faded opacity clears a bar that also rises with $s$:
 
-$$
+```math
 \text{keep } i \iff \alpha_i' > 0.005\, s
-$$
+```
 
 If fewer than 5,000 Gaussians pass, CLoD-GS keeps the 5,000 with the highest faded opacity. Turning $s$ up makes everything fade faster and raises the bar at the same time, so fewer Gaussians get drawn. At $s = 1$ you get full detail.
+
+![CLoD-GS at s = 1, 5 and 15 on a truck test view](assets/clod_dial.jpg)
+
+*Plain CLoD-GS on a held-out truck photo. Going from $s = 1$ to $s = 5$ drops a third of the Gaussians with no loss in quality. At $s = 15$ it draws a third as many as at $s = 1$, and the far trees and buildings (zoomed in below) are the first to fall apart because they are farthest from the camera. CLoD-GS only goes by distance and each Gaussian's learned fade rate, so it can't tell whether anyone would look there.*
 
 ## What GazeCLoD-GS changes
 
 Instead of one $s$ for the whole scene, every Gaussian gets its own:
 
-$$
+```math
 s_i = \max\left(1,\ s_{\text{base}}\, e^{-k\, h_i}\right)
-$$
+```
 
 - $h_i$ is the Gaussian's **heat**, a number from 0 to 1 for how much people looked at it ([next section](#where-the-heat-comes-from)).
 - $k$ is how strongly heat counts. With $k = 0$ every Gaussian gets the same $s$, which is plain CLoD-GS. The main results use $k = 4$.
@@ -57,19 +61,23 @@ The only change to CLoD-GS's own code is 6 lines in `scene/gaussian_model.py` (`
 
 The recordings use VR's axes (y up, z backward), while the splat uses y down and z forward. Reading the EyeNavGS viewer's source code showed that the fix is a 180° flip around the x axis, $M = \mathrm{diag}(1, -1, -1)$:
 
-$$
+```math
 C = M\,p, \qquad R = M\,R(q)\,M, \qquad \mathbf{g} = M\,R(q_{\text{gaze}})\,(0, 0, -1)^\top
-$$
+```
 
-$p$ and $q$ are the recorded eye position and rotation (a quaternion). $C$ and $R$ are the camera's position and rotation in the splat (the second $M$ flips the camera's own axes the same way), and $\mathbf{g}$ is the gaze direction. To check it, `check_alignment.py` renders people's recorded views with their gaze drawn on top. The views come out upright and the gaze lands on things like the truck's logo, signs and wheels.
+$p$ and $q$ are the recorded eye position and rotation (a quaternion). $C$ and $R$ are the camera's position and rotation in the splat (the second $M$ flips the camera's own axes the same way), and $\mathbf{g}$ is the gaze direction. To check it, `check_alignment.py` renders people's recorded views with their gaze drawn on top. The views come out upright and the gaze lands on real objects.
+
+![Recorded VR views with gaze circles, truck and playroom](assets/gaze_alignment.jpg)
+
+*Three moments from one NTHU viewer per scene, rendered from the splat at the recorded head pose. The red circle is where they were looking: the truck's logo, an umbrella and a street sign pole on top, a toy on the table, a red binder on the shelf and a light switch below. The black areas in the truck views are sky and street that the original photos never covered, so the splat has nothing there. That's why empty pixels are skipped when measuring quality.*
 
 ### Picking the glances
 
 I sample each person's gaze 10 times per second. While the eye jumps from one target to the next (a saccade) it barely sees anything, so those moments are dropped. A sample counts as a jump if the gaze turns faster than 100° per second:
 
-$$
+```math
 \frac{\angle(\mathbf{g}_t,\ \mathbf{g}_{t - \Delta t})}{\Delta t} > 100^\circ/\text{s}
-$$
+```
 
 That leaves about 14,000 glances per scene.
 
@@ -77,29 +85,29 @@ That leaves about 14,000 glances per scene.
 
 For each glance I render a tiny 48×48 image looking straight down the gaze direction. Only the center of your vision (the fovea, a few degrees wide) sees sharply, so each pixel is weighted by how close it is to that center:
 
-$$
+```math
 w(p) = \frac{e^{-\theta_p^2 / 2\sigma^2}}{\sum_{p'} e^{-\theta_{p'}^2 / 2\sigma^2}}, \qquad \sigma = 2.5^\circ
-$$
+```
 
 $\theta_p$ is the angle between pixel $p$ and the gaze direction, and the tiny camera covers $\pm 3\sigma$.
 
 A splat image is a front-to-back blend. With the Gaussians sorted from nearest to farthest, pixel $p$ gets the color
 
-$$
+```math
 C(p) = \sum_i c_i\, \alpha_i(p)\, T_i(p), \qquad T_i(p) = \prod_{j < i} \big(1 - \alpha_j(p)\big)
-$$
+```
 
-$c_i$ is Gaussian $i$'s color, $\alpha_i(p)$ is how opaque it is at that pixel, and $T_i(p)$ is how much light still gets through the Gaussians in front of it. So $\alpha_i(p)\,T_i(p)$ is exactly Gaussian $i$'s share of that pixel. A glance gives each Gaussian credit for its share of the weighted center of vision:
+$c_i$ is Gaussian $i$'s color, $\alpha_i(p)$ is how opaque it is at that pixel, and $T_i(p)$ is how much light still gets through the Gaussians in front of it. So $\alpha_i(p) T_i(p)$ is exactly Gaussian $i$'s share of that pixel. A glance gives each Gaussian credit for its share of the weighted center of vision:
 
-$$
+```math
 \text{heat}_i = \sum_p w(p)\, \alpha_i(p)\, T_i(p)
-$$
+```
 
 Working this out one Gaussian at a time would be far too slow. The shortcut is that the weighted image is a plain weighted sum of the colors $c_i$, so its derivative with respect to $c_i$ is exactly that share:
 
-$$
+```math
 \frac{\partial}{\partial c_i} \sum_p w(p)\, C(p) = \sum_p w(p)\, \alpha_i(p)\, T_i(p)
-$$
+```
 
 The renderer can already compute derivatives like this for training, so one backward pass (the gradient step PyTorch runs during training) gives the heat of all ~2 million Gaussians at once.
 
@@ -109,9 +117,9 @@ Every person counts equally. A person's heat is the average over their glances, 
 
 Last, the heat is squeezed into $[0, 1]$:
 
-$$
+```math
 h_i = \min\left(1,\ \frac{H_i}{H_{99}}\right)^{\gamma}, \qquad \gamma = 0.5
-$$
+```
 
 $H_{99}$ is the 99th percentile of heat among the Gaussians that got any. Dividing by that instead of the maximum stops a few extreme Gaussians from flattening everything else, and the square root ($\gamma = 0.5$) lifts the lukewarm Gaussians a bit.
 
@@ -119,11 +127,22 @@ $H_{99}$ is the 99th percentile of heat among the Gaussians that got any. Dividi
 
 My first heat was a simpler "stamp" score. Every glance stamps each Gaussian whose *center* sits near the gaze direction and isn't hidden behind a surface:
 
-$$
+```math
 H_i = \sum_{\text{glances}} e^{-\theta_i^2 / 2\sigma^2}\, v_i
-$$
+```
 
 $\theta_i$ is the angle between the gaze and the direction to Gaussian $i$'s center, and $v_i = 1$ when the center is no more than 10% deeper than the visible surface at that spot (averaged and summed over people the same way). Its heatmaps looked more convincing, with red on the truck and gray on the pavement. For LOD it was worse. At all but the lightest budget it gained only +0.2 to +1.5 dB where people look (the blending-share score gained +4.7 to +6.8 dB, both at $k = 2$), and it lost up to 5.4 dB over the whole frame. The blending-share score credits the Gaussians that actually make up what people see, including big ones whose centers sit off to the side. It turned out that the heatmap that looks best as a picture was the worse one for LOD.
+
+![Truck heat: rendered view, stamp score, blending-share score](assets/heat_truck.jpg)
+
+*Heat from all 24 NTHU viewers on truck, painted onto each Gaussian (red = most heat, blue = a little, gray = none). The stamp score (middle) lights up the truck and its wheels, which matches where people looked. The blending-share score (right) is what GazeCLoD-GS actually uses. Each big Gaussian, like a slab of pavement, fills a lot of every glance and scores high on its own, while a detailed object splits its credit across many tiny Gaussians. The log color scale makes it look even redder. Protecting those big Gaussians keeps the scene's structure intact around and behind whatever people look at, which is likely part of why the whole frame improves too.*
+
+<details>
+<summary>Same heat figure for playroom</summary>
+
+![Playroom heat: rendered view, stamp score, blending-share score](assets/heat_playroom.jpg)
+
+</details>
 
 ## Fair comparison
 
@@ -132,9 +151,9 @@ Both methods have to draw the same number of Gaussians, or one could look better
 1. Run plain CLoD-GS at dial $s$ and count the Gaussians it keeps **in view**: center in front of the camera (depth above 0.2) and inside the field of view plus a 10% margin.
 2. Find the smallest $s_{\text{base}}$ where GazeCLoD-GS keeps no more Gaussians in view than that:
 
-$$
+```math
 s_{\text{base}}^{*} = \min \left\{ s_{\text{base}} \;:\; N_{\text{view}}(s_{\text{base}}) \le N_{\text{view}}^{\text{CLoD}}(s) \right\}
-$$
+```
 
 Raising $s_{\text{base}}$ can only remove Gaussians, since every $s_i$ goes up and every keep test gets harder. So a binary search works: try a value, count, cut the range in half, repeat.
 
@@ -143,14 +162,14 @@ I count only Gaussians in view because the renderer throws away everything outsi
 ## How I measured quality
 
 - **Split:** heat from 12 NTHU viewers (odd user numbers), tested on the other 12 (even), then swapped. Nobody is ever tested against heat that includes their own eyes.
-- **Test frames:** one moment every 2 seconds of each test viewer's recording (saccades skipped), using their real head pose and gaze. That gives 721 frames per scene, rendered at 512×512 with a 90° field of view, at five budgets $s \in \{2, 4, 8, 12, 16\}$.
+- **Test frames:** one moment every 2 seconds of each test viewer's recording (saccades skipped), using their real head pose and gaze. That gives 721 frames per scene, rendered at 512×512 with a 90° field of view, at five budgets: $s$ = 2, 4, 8, 12 and 16.
 - **Reference:** the same model at full detail ($s = 1$). VR views have no real photo to compare against.
 - **Regions:** the whole frame, and "where they look", meaning pixels within 5° of that viewer's actual gaze. Empty pixels (opacity below 0.5 in the full-detail render, mostly missing sky) are skipped.
 - **Scores:** PSNR, plus SSIM and LPIPS. With pixel values from 0 to 1,
 
-$$
+```math
 \text{PSNR} = 10 \log_{10} \frac{1}{\text{MSE}}
-$$
+```
 
 so +3 dB means about half the error and +10 dB means a tenth of it.
 
@@ -185,6 +204,10 @@ There is one weak spot. At the tightest playroom budget ($s = 16$, only 16% of G
 ![Example frames: full detail, plain CLoD-GS, GazeCLoD-GS](assets/truck_examples.jpg)
 
 *Truck at $s = 16$. I picked these frames because their gain sits at the median. Left: full detail. Middle: plain CLoD-GS. Right: GazeCLoD-GS with the same number of Gaussians in view.*
+
+![Playroom example frames: full detail, plain CLoD-GS, GazeCLoD-GS](assets/playroom_examples.jpg)
+
+*Playroom at $s = 12$, also picked at the median gain, in the same layout.*
 
 ## What's in this repo
 
