@@ -22,7 +22,8 @@ Controls (click the window first; drag its corner to resize):
   R                 replay a real recorded viewer (N = next viewer, SPACE = pause); R again to stop
   T                 switch scene (truck / playroom); each scene remembers where you were
   ESC               quit
-  (extra: K cycles the strength k, M turns the quality readout off for more fps)
+  (extra: K cycles the strength k, M turns the quality readout off for more fps,
+   P saves a screenshot to output/viewer_shots/)
 """
 import argparse
 import ctypes
@@ -449,6 +450,12 @@ def main():
         if key == ord("k"): k = {1.0: 2.0, 2.0: 4.0, 4.0: 1.0}.get(k, 2.0)
         if key == ord("m"): show_metric = not show_metric
         if key == ord("z"): zoom_on = not zoom_on
+        if key == ord("p"):  # screenshot of exactly what is on screen, at full render resolution
+            os.makedirs(os.path.join("output", "viewer_shots"), exist_ok=True)
+            shot = os.path.join("output", "viewer_shots", f"{sc.name}_{time.strftime('%Y%m%d_%H%M%S')}.png")
+            frame.save(shot)
+            note, note_until = f"screenshot saved: {shot}", now + 3
+            print(f"Screenshot saved: {os.path.abspath(shot)}")
         if key == ord(" "): paused = not paused
         if key in (ord("t"), ord("T")):
             if len(names) < 2:

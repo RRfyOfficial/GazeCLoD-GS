@@ -157,7 +157,7 @@ s_{\text{base}}^{*} = \min \left\{ s_{\text{base}} \;:\; N_{\text{view}}(s_{\tex
 
 Raising $s_{\text{base}}$ can only remove Gaussians, since every $s_i$ goes up and every keep test gets harder. So a binary search works: try a value, count, cut the range in half, repeat.
 
-I count only Gaussians in view because the renderer throws away everything outside the view almost for free. My first version matched the total count instead, and GazeCLoD-GS ended up spending its budget on hot Gaussians behind the camera, sometimes drawing 36% fewer Gaussians in view than CLoD-GS. With matching in view, both sides draw the same number (within 0.3%) and take the same render time.
+I count only Gaussians in view because the renderer throws away everything outside the view almost for free. My first version matched the total count instead, and GazeCLoD-GS ended up spending its budget on hot Gaussians behind the camera, sometimes drawing 36% fewer Gaussians in view than CLoD-GS. With matching in view, both sides draw the same number (within 0.3%), and at 512×512 they take about the same time (within 3%). Bigger images are a different story, see [Render time at VR-like sizes](#render-time-at-vr-like-sizes).
 
 ## How I measured quality
 
@@ -179,25 +179,25 @@ Median PSNR gain of GazeCLoD-GS ($k = 4$, gaze + head heat) over plain CLoD-GS w
 
 | CLoD-GS budget $s$ | Truck, where they look | Truck, whole frame | Playroom, where they look | Playroom, whole frame |
 |---|---|---|---|---|
-| 2 | +8.0 dB | +6.9 dB | +8.1 dB | +6.1 dB |
-| 4 | +6.5 dB | +4.3 dB | +4.2 dB | +3.4 dB |
+| 2 | +8.0 dB | +6.9 dB | +8.1 dB | +6.0 dB |
+| 4 | +6.5 dB | +4.3 dB | +4.2 dB | +3.3 dB |
 | 8 | +8.2 dB | +3.4 dB | +3.9 dB | +3.0 dB |
 | 12 | +8.5 dB | +1.6 dB | +3.8 dB | +2.2 dB |
 | 16 | +6.7 dB | +2.0 dB | +3.2 dB | +0.8 dB |
 
-Where people look, the gain is +3.2 to +8.5 dB, and the whole frame gets better too (+0.8 to +6.9 dB), all at the same cost. GazeCLoD-GS wins where people look in 91 to 99% of frames on truck and 85 to 98% on playroom, and all 24 test viewers have a positive median gain at every budget in both scenes.
+Where people look, the gain is +3.2 to +8.5 dB, and the whole frame gets better too (+0.8 to +6.9 dB), all with the same number of Gaussians. GazeCLoD-GS wins where people look in 91 to 99% of frames on truck and 85 to 98% on playroom, and all 24 test viewers have a positive median gain at every budget in both scenes.
 
 ![Quality vs budget](assets/quality_vs_budget.png)
 
 In the chart, "gaze only" and "head direction only" are the two halves of the heat used on their own. The shuffled control gives the same heat values to random Gaussians. It does no better than plain CLoD-GS (−2.8 to +0.6 dB where people look), which shows the gain comes from the recordings themselves.
 
-Flipped around, GazeCLoD-GS needs 13 to 35% fewer Gaussians on truck and 23 to 32% fewer on playroom to match plain CLoD-GS's quality where people look. That makes frames 5 to 11% faster at 512×512. The time saving is smaller than the Gaussian saving because part of every frame's cost (like running the keep test over all Gaussians) doesn't shrink.
+Flipped around, GazeCLoD-GS needs 13 to 35% fewer Gaussians on truck and 23 to 32% fewer on playroom to match plain CLoD-GS's quality where people look. In the timing test that made frames 3 to 8% faster at 512×512. The time saving is smaller than the Gaussian saving because part of every frame's cost (like running the keep test over all Gaussians) doesn't shrink, and it disappears at bigger image sizes ([below](#render-time-at-vr-like-sizes)).
 
 On truck, heat from 6 people already gives about 90% of the gain from all 12, and even a single person helps a little (+1.4 to +2.3 dB).
 
 Two reference rows show how far this could go. A "live" version builds heat from only the test viewer's current glance (what an eye tracker would give in the moment, scored with the stamp formula) and gains +1.2 to +2.8 dB on truck. An "oracle" knows exactly which Gaussians make up the pixels the viewer is looking at in that very frame. It gains +16 to +23 dB on truck, but it needs the full-detail render of that frame, which is exactly what LOD is trying to avoid. So a better heat still has a lot of room to grow.
 
-The cost is one extra number per Gaussian: +9.4 MB on truck's 594 MB model (+1.6%) as a 32-bit float, or +0.4% as a single byte. Building a heat file takes about 3 to 4 minutes per scene on a laptop RTX 4070. Working out every $s_i$ is one quick formula per Gaussian, so render time is unchanged at the same budget.
+The cost is one extra number per Gaussian: +9.4 MB on truck's 594 MB model (+1.6%) as a 32-bit float, or +0.4% as a single byte. Building a heat file takes about 3 to 4 minutes per scene on a laptop RTX 4070. Working out every $s_i$ takes about 0.1 ms per frame.
 
 There is one weak spot. At the tightest playroom budget ($s = 16$, only 16% of Gaussians kept) the median frame still improves, but a minority of frames lose a lot of the room outside the hot areas. Those frames drag the whole-frame PSNR averaged over all frames down from 28.3 to 24.6 dB. A gentler $k = 2$ avoids this.
 
@@ -208,6 +208,23 @@ There is one weak spot. At the tightest playroom budget ($s = 16$, only 16% of G
 ![Playroom example frames: full detail, plain CLoD-GS, GazeCLoD-GS](assets/playroom_examples.jpg)
 
 *Playroom at $s = 12$, also picked at the median gain, in the same layout.*
+
+## Render time at VR-like sizes
+
+The main experiment renders 512×512 images, but a VR headset renders much bigger ones (a Quest Pro eye is about 1800×1920). So `timing.py` re-times one moment per test viewer at four sizes on the laptop RTX 4070, with the methods interleaved and every render timed 5 times.
+
+| Image size | Truck: extra time at the same budget | Truck: time saved at equal quality | Playroom: extra time at the same budget | Playroom: time saved at equal quality |
+|---|---|---|---|---|
+| 512×512 | +1 to +2% | 3 to 6% | +1 to +3% | 4 to 8% |
+| 1024×1024 | +1 to +5% | 2 to 3% | +2 to +12% | 0 to 5% |
+| 1536×1536 | +1 to +10% | 0 to 3% | +2 to +16% | −3 to +4% |
+| 2048×2048 | +1 to +13% | −3 to +2% | +1 to +18% | −5 to +4% |
+
+"Extra time at the same budget" is how much longer GazeCLoD-GS takes than plain CLoD-GS with the same number of Gaussians in view. "Time saved at equal quality" uses the smaller number of Gaussians GazeCLoD-GS needs to match plain CLoD-GS where people look (measured at 512×512). Each range goes from the loosest budget to the tightest, as medians over 24 test moments, and the extra time is always largest at the tightest budget.
+
+At 512×512 the two take about the same time, and the equal-quality version is 3 to 8% faster. As the image grows, GazeCLoD-GS gets slower than plain CLoD-GS at the same count, and at 2048×2048 the equal-quality time saving is gone. The reason is that counting Gaussians stops being a fair measure of cost at high resolution. Most of the time then goes into blending pixels: on truck, every 100k Gaussians in view cost plain CLoD-GS about 1.2 ms at 512×512 and 3.6 ms at 2048×2048. So a Gaussian that covers more of the screen costs more. The blending-share heat gives the most credit to Gaussians that fill a lot of each glance, which tend to be big, so GazeCLoD-GS most likely keeps more screen-filling Gaussians for the same count. A natural next step is to set the budget by how much of the screen the Gaussians cover instead of how many there are.
+
+Computing every $s_i$ adds about 0.1 ms per frame.
 
 ## What's in this repo
 
@@ -224,6 +241,8 @@ Everything I wrote lives in [`gazeclod/`](gazeclod). The rest is the CLoD-GS cod
 | `gazeclod/lod_policy.py` | The per-Gaussian $s_i$, budget matching, the odd/even split and the shuffled control |
 | `gazeclod/lod_demo.py` | Small demo at a single budget |
 | `gazeclod/eval_gaze_lod.py` | The main experiment: every method, budget and score written to a CSV, plus a summary |
+| `gazeclod/plot_results.py` | Quality-vs-budget chart and gain tables (Markdown and LaTeX) from the experiment CSVs |
+| `gazeclod/timing.py` | Render-time test at larger, VR-like image sizes |
 | `gazeclod/make_examples.py`, `make_video.py` | Example frames figure and the side-by-side video |
 | `gazeclod/viewer.py`, `run_viewer.bat`, `run_viewer.sh` | Live interactive viewer |
 
@@ -237,7 +256,7 @@ cd GazeCLoD-GS
 conda create -n clodgs python=3.10 -y
 conda activate clodgs
 pip install torch==2.7.1 torchvision==0.22.1 --index-url https://download.pytorch.org/whl/cu128
-pip install plyfile tqdm opencv-python joblib
+pip install plyfile tqdm opencv-python joblib matplotlib
 ```
 
 Then build the three CUDA extensions. On Windows, do this in the "x64 Native Tools Command Prompt for VS 2022" after `set DISTUTILS_USE_SDK=1` and `set TORCH_CUDA_ARCH_LIST=8.9` (8.9 is the RTX 40 series, so change it for your GPU):
@@ -283,9 +302,10 @@ python gazeclod/eval_gaze_lod.py -m output/truck_clod --scene truck --heat outpu
 python gazeclod/eval_gaze_lod.py -m output/truck_clod --summary output/truck_clod/gaze_lod/results_main.csv
 ```
 
-**5. Make the figures and the video**, using the same `--heat` value as step 4 in place of `<heat>`.
+**5. Make the figures and the video**, using the same `--heat` value as step 4 in place of `<heat>`. The first command makes the quality-vs-budget chart and the gain table. It only needs the CSVs, so it runs without a GPU. List several CSVs for a scene with commas, and add one `--scene` per scene.
 
 ```bash
+python gazeclod/plot_results.py --scene truck=output/truck_clod/gaze_lod/results_main.csv
 python gazeclod/make_examples.py -m output/truck_clod --scene truck --heat <heat> --frames even:user12:3538 odd:user19:2894
 python gazeclod/make_video.py -m output/truck_clod --scene truck --heat <heat> --user user12
 ```
@@ -297,7 +317,26 @@ python gazeclod/viewer.py                    # starts in truck
 python gazeclod/viewer.py --scene playroom   # starts in playroom
 ```
 
-The left half is plain CLoD-GS and the right half is GazeCLoD-GS, always with the same number of Gaussians. Your mouse plays the eye tracker. Hold W A S D to walk, left-drag to turn, press `[` and `]` for fewer or more Gaussians, 1 to 4 to change the right half, Z for a zoom box, R to replay a recorded viewer, T to switch scenes and ESC to quit.
+The left half is plain CLoD-GS and the right half is GazeCLoD-GS, always with the same number of Gaussians. Your mouse plays the eye tracker. Hold W A S D to walk, left-drag to turn, press `[` and `]` for fewer or more Gaussians, 1 to 4 to change the right half, Z for a zoom box, R to replay a recorded viewer, T to switch scenes, P to save a screenshot and ESC to quit.
+
+![The live viewer on truck with the zoom box on](assets/viewer_truck.jpg)
+
+*The live viewer on truck with the zoom box on. Both halves draw about 360k Gaussians. Where the mouse points (the truck's logo), plain CLoD-GS scores 27.2 dB and GazeCLoD-GS 41.2 dB against the full-detail render.*
+
+<details>
+<summary>Playroom, and the heatmap view (key 4)</summary>
+
+![The live viewer on playroom](assets/viewer_playroom.jpg)
+
+![The live viewer showing the crowd heatmap](assets/viewer_heatmap.jpg)
+
+</details>
+
+**7. Time it at VR-like sizes** (optional, about 5 to 10 minutes). Renders one moment per viewer at 512, 1024, 1536 and 2048 pixels square and compares plain CLoD-GS with GazeCLoD-GS at the same budget and at equal quality. Close other GPU programs first.
+
+```bash
+python gazeclod/timing.py -m output/truck_clod --scene truck --heat <heat>
+```
 
 ## Credits
 
