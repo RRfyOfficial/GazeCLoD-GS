@@ -48,13 +48,24 @@ from gazeclod.lod_policy import LodState, match_budget, s_vector, user_number  #
 SAVINGS = {"truck": "4:0.13,8:0.13,12:0.23,16:0.35", "playroom": "8:0.23,12:0.30,16:0.32"}
 
 
-def cuda_ms(fn):
+def cuda_ms(fn, keep=False):
     a, b = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
     a.record()
-    fn()
+    out = fn()
     b.record()
     torch.cuda.synchronize()
-    return a.elapsed_time(b)
+    return (a.elapsed_time(b), out) if keep else a.elapsed_time(b)
+
+
+def screen_work(radii, size):
+    """
+    How much screen the drawn Gaussians cover, from the rasterizer's per-Gaussian radius r (pixels):
+      tiles = sum of (2r/16 + 1)^2, about how many 16x16 tiles each Gaussian touches. The rasterizer
+              blends every Gaussian into every pixel of every tile it touches, so this tracks its work.
+      cover = sum of pi r^2 / pixels, about how many Gaussians lie over an average pixel.
+    """
+    r = radii[radii > 0].float()
+    return float(((2 * r / 16 + 1) ** 2).sum()), float((math.pi * r ** 2).sum() / (size * size))
 
 
 def test_moments(bank, eyenav, site, scene):
@@ -100,6 +111,25 @@ def summarize(csv_path, out_md=None):
             eq_n = f"{med('equal', 'n_view') / 1e3:.0f}k" if eq == eq else ""
             eq_ms = f"{eq:.2f}" if eq == eq else ""
             lines.append(f"| {s:g} | {med('uniform', 'n_view') / 1e3:.0f}k | {u:.2f} | {same:.2f} | {eq_n} | {eq_ms} | {saved} |")
+    if rows and rows[0].get("tiles") not in (None, ""):
+        pair = defaultdict(dict)
+        for r in rows:
+            pair[(int(r["size"]), r["user"], float(r["s"]))][r["policy"]] = r
+        lines.append("\n### Same number of Gaussians in view: how much more work GazeCLoD-GS's Gaussians make\n")
+        lines.append("| Size | s | Extra time | Extra tile work | Avg. Gaussians over a pixel, plain / ours |")
+        lines.append("|---|---|---|---|---|")
+        for size in sorted({k[0] for k in pair}):
+            for s in sorted({k[2] for k in pair if k[0] == size and k[2] != 1}):
+                g = [v for k, v in pair.items() if k[0] == size and k[2] == s and "same" in v and "uniform" in v]
+                if not g:
+                    continue
+                t = np.median([float(v["same"]["ms"]) / float(v["uniform"]["ms"]) for v in g])
+                w = np.median([float(v["same"]["tiles"]) / float(v["uniform"]["tiles"]) for v in g])
+                cu = np.median([float(v["uniform"]["cover"]) for v in g])
+                co = np.median([float(v["same"]["cover"]) for v in g])
+                lines.append(f"| {size} | {s:g} | {100 * (t - 1):+.1f}% | {100 * (w - 1):+.1f}% | {cu:.1f} / {co:.1f} |")
+        lines.append("\nMedians over test moments of the per-moment ratio (GazeCLoD-GS / plain CLoD-GS). Tile work = sum over "
+                     "drawn Gaussians of the 16x16 tiles each one touches.")
     sv = [float(r["sv_ms"]) for r in rows if r.get("sv_ms") not in (None, "", "nan")]
     if sv:
         lines.append(f"\nComputing every s_i (GazeCLoD-GS's only extra per-frame work): median {np.median(sv):.3f} ms.")
@@ -152,7 +182,7 @@ def main():
     out_dir = os.path.join(args.model, "gaze_lod")
     os.makedirs(out_dir, exist_ok=True)
     out_csv = os.path.join(out_dir, f"timing_{args.tag}.csv")
-    fields = ["size", "user", "row", "s", "policy", "s_base", "n_view", "ms", "sv_ms"]
+    fields = ["size", "user", "row", "s", "policy", "s_base", "n_view", "ms", "sv_ms", "tiles", "cover"]
     fh = open(out_csv, "w", newline="")
     writer = csv.DictWriter(fh, fieldnames=fields)
     writer.writeheader()
@@ -177,14 +207,17 @@ def main():
                 if s in savings:
                     sb2, n2 = match_budget(st, h, args.k, int(target * (1 - savings[s])), s)
                     jobs.append(("equal", s, sb2, n2, s_vector(h, sb2, args.k)[:, None]))
-            times = defaultdict(list)
+            times, work = defaultdict(list), {}
             try:
                 with torch.no_grad():
                     for rep in range(args.warmup + args.repeats):
                         for j, (pol, s, sb, n, sv) in enumerate(jobs):
-                            ms = cuda_ms(lambda: render_rgb(cam, gs, pipe, bg, s=sv if sv is not None else s))
+                            ms, pkg = cuda_ms(lambda: render_rgb(cam, gs, pipe, bg, s=sv if sv is not None else s), keep=True)
                             if rep >= args.warmup:
                                 times[j].append(ms)
+                            if rep == args.warmup:  # same Gaussians every repeat, so measure coverage once
+                                work[j] = screen_work(pkg["radii"], size)
+                            del pkg
                     sv_ms = np.median([cuda_ms(lambda: s_vector(h, jobs[-1][2], args.k)) for _ in range(10)])
             except torch.cuda.OutOfMemoryError:
                 print(f"  out of GPU memory at {size} x {size}, skipping this size")
@@ -193,7 +226,8 @@ def main():
             for j, (pol, s, sb, n, sv) in enumerate(jobs):
                 writer.writerow({"size": size, "user": uid, "row": i, "s": s, "policy": pol,
                                  "s_base": round(float(sb), 4), "n_view": n,
-                                 "ms": round(float(np.median(times[j])), 3), "sv_ms": round(float(sv_ms), 4)})
+                                 "ms": round(float(np.median(times[j])), 3), "sv_ms": round(float(sv_ms), 4),
+                                 "tiles": round(work[j][0]), "cover": round(work[j][1], 3)})
             fh.flush()
             ju = max(j for j, job in enumerate(jobs) if job[0] == "uniform")
             print(f"  {n_m + 1}/{len(moments)} {uid}: full detail {np.median(times[0]):.1f} ms, "

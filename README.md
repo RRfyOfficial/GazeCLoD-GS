@@ -6,7 +6,7 @@ Russell Mehta. Final project for CMSC740 Advanced Computer Graphics (Prof. Matth
 
 ![Plain CLoD-GS vs GazeCLoD-GS, same number of Gaussians](assets/truck_demo.gif)
 
-*A real person's recorded walk around the truck in VR, replayed with the same number of Gaussians on both sides. Left is plain CLoD-GS, right is GazeCLoD-GS. The red circle is where this person was actually looking, and the box in the corner zooms in 3x on that spot. This person's own eye data was never used to build the heat. It came from 12 other people.*
+*A real person's recorded walk around the truck in VR, replayed with the same number of Gaussians on both sides. Left is plain CLoD-GS, right is GazeCLoD-GS. The red circle is where this person was actually looking, and the box in the corner zooms in 3x on that spot. The number at the top of each side is its quality where the person looks (PSNR against the full-detail render, higher is better), and the chart underneath tracks both numbers over the whole walk. This person's own eye data was never used to build the heat. It came from 12 other people.*
 
 ## The problem
 
@@ -222,7 +222,19 @@ The main experiment renders 512×512 images, but a VR headset renders much bigge
 
 "Extra time at the same budget" is how much longer GazeCLoD-GS takes than plain CLoD-GS with the same number of Gaussians in view. "Time saved at equal quality" uses the smaller number of Gaussians GazeCLoD-GS needs to match plain CLoD-GS where people look (measured at 512×512). Each range goes from the loosest budget to the tightest, as medians over 24 test moments, and the extra time is always largest at the tightest budget.
 
-At 512×512 the two take about the same time, and the equal-quality version is 3 to 8% faster. As the image grows, GazeCLoD-GS gets slower than plain CLoD-GS at the same count, and at 2048×2048 the equal-quality time saving is gone. The reason is that counting Gaussians stops being a fair measure of cost at high resolution. Most of the time then goes into blending pixels: on truck, every 100k Gaussians in view cost plain CLoD-GS about 1.2 ms at 512×512 and 3.6 ms at 2048×2048. So a Gaussian that covers more of the screen costs more. The blending-share heat gives the most credit to Gaussians that fill a lot of each glance, which tend to be big, so GazeCLoD-GS most likely keeps more screen-filling Gaussians for the same count. A natural next step is to set the budget by how much of the screen the Gaussians cover instead of how many there are.
+At 512×512 the two take about the same time, and the equal-quality version is 3 to 8% faster. As the image grows, GazeCLoD-GS gets slower than plain CLoD-GS at the same count, and at 2048×2048 the equal-quality time saving is gone. The reason is that counting Gaussians stops being a fair measure of cost at high resolution. Most of the time then goes into blending pixels: on truck, every 100k Gaussians in view cost plain CLoD-GS about 1.2 ms at 512×512 and 3.6 ms at 2048×2048. So a Gaussian that covers more of the screen costs more.
+
+To check that this is what happens, a second timing run (`--tag cover`) also records how many 16×16 pixel tiles the drawn Gaussians touch. The renderer blends every Gaussian into every tile it touches, so this tile count tracks its real workload.
+
+| Budget $s$ | Truck: extra tile work | Truck: extra time at 2048×2048 | Playroom: extra tile work | Playroom: extra time at 2048×2048 |
+|---|---|---|---|---|
+| 2 | +1% | +1% | +3% | +1% |
+| 4 | +5% | +3% | +12% | +4% |
+| 8 | +12% | +4% | +27% | +9% |
+| 12 | +27% | +8% | +39% | +13% |
+| 16 | +42% | +12% | +63% | +19% |
+
+With the same number of Gaussians in view, the Gaussians GazeCLoD-GS keeps touch up to 42% more tiles on truck and 63% more on playroom, and the gap grows as the budget tightens, just like the extra time. At 512×512 the same extra tile work barely shows up in the time (at most +2% on truck and +5% on playroom), because the fixed part of each frame dominates. So the Gaussians GazeCLoD-GS keeps really are bigger on screen. That fits how the heat works: the blending-share score gives the most credit to Gaussians that fill a lot of each glance, and those tend to be big. A natural next step is to set the budget by how much of the screen the Gaussians cover instead of how many there are, or to divide each Gaussian's heat by its size.
 
 Computing every $s_i$ adds about 0.1 ms per frame.
 
